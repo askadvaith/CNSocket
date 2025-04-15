@@ -8,11 +8,14 @@ import platform
 import traceback  # Added for better error reporting
 
 # Configure server address - use localhost for working on the same system
-SERVER_URI = "ws://10.20.202.214:8765"
+SERVER_URI = "ws://localhost:8765"
 filename = "script.py"  # Default filename
 content = ""
 output = ""
 error_message = ""  # Added to store error messages
+cursor_x = 0
+cursor_y = 0
+scroll_offset_y = 0  # Track vertical scroll position
 
 # Check if we need to configure Windows terminal for proper curses support
 if platform.system() == "Windows":
@@ -32,6 +35,20 @@ if platform.system() == "Windows":
     except:
         pass
 
+# Function to filter source code files
+def is_source_file(filename):
+    """Filter function to show only source code files (not executables)"""
+    # Common source file extensions to include
+    source_extensions = [
+        '.py', '.c', '.cpp', '.h', '.hpp', '.java', '.js', '.html', '.css',
+        '.php', '.rb', '.go', '.rs', '.ts', '.sh', '.bat', '.md', '.txt',
+        '.json', '.xml', '.yaml', '.yml', '.ini', '.cfg', '.conf'
+    ]
+    
+    # Check if the file has a source extension
+    _, ext = os.path.splitext(filename.lower())
+    return ext in source_extensions
+
 async def file_selection_screen(stdscr, websocket):
     """Display a menu for file selection or creation"""
     global filename
@@ -48,6 +65,9 @@ async def file_selection_screen(stdscr, websocket):
     
     files = data.get("files", [])
     
+    # Filter out executable files and other non-source files
+    files = [f for f in files if is_source_file(f)]
+    
     # Menu options
     options = files + ["[Create New File]"]
     selected = 0
@@ -58,7 +78,7 @@ async def file_selection_screen(stdscr, websocket):
         
         # Draw header
         stdscr.addstr(0, 0, "Select a file to edit or create a new one:")
-        stdscr.addstr(1, 0, "Use arrow keys to navigate, Enter to select")
+        stdscr.addstr(1, 0, "Use arrow keys to navigate, Enter to select, Ctrl+X to exit")
         
         # Draw file options
         for i, option in enumerate(options):
@@ -87,7 +107,7 @@ async def file_selection_screen(stdscr, websocket):
                 filename = options[selected]
                 return True
                 
-        elif key == 27:  # ESC
+        elif key == 24:  # Ctrl+X key to exit
             return False  # Exit
 
 async def create_new_file(stdscr, websocket):
@@ -131,11 +151,23 @@ async def create_new_file(stdscr, websocket):
     
     return False
 
-async def update_screen(stdscr, websocket, cursor_pos=None):
-    global content, output, error_message
+# Function to adjust scroll position based on cursor
+def adjust_scroll_position(cursor_y, editor_height):
+    global scroll_offset_y
     
-    # Get cursor position
-    current_cursor_y, current_cursor_x = cursor_pos if cursor_pos else (0, 0)
+    # Keep cursor in view with some margin
+    margin = min(3, editor_height // 4)
+    
+    # If cursor is above visible area, scroll up
+    if cursor_y < scroll_offset_y + margin:
+        scroll_offset_y = max(0, cursor_y - margin)
+    
+    # If cursor is below visible area, scroll down
+    elif cursor_y >= scroll_offset_y + editor_height - margin:
+        scroll_offset_y = max(0, cursor_y - editor_height + margin + 1)
+
+async def update_screen(stdscr, websocket, cursor_pos=None):
+    global content, output, error_message, cursor_x, cursor_y, scroll_offset_y
     
     # Configure curses
     curses.curs_set(1)  # Show cursor
@@ -144,16 +176,29 @@ async def update_screen(stdscr, websocket, cursor_pos=None):
     # Initial screen
     stdscr.clear()
     height, width = stdscr.getmaxyx()
-    header = f"Editing: {filename} (Press 'ESC' to exit, 'F5' or 'Ctrl+R' to run)"
+    header = f"Editing: {filename} (Press 'Ctrl+X' to exit, 'Ctrl+R' to run)"
     stdscr.addstr(0, 0, header[:width-1])
     stdscr.refresh()
     
     editor_start_y = 2
     output_start_y = height // 2
     
+    # Calculate editor height
+    editor_height = output_start_y - editor_start_y - 1
+    
     # Fix: Draw the editor once initially to make sure content is displayed
     draw_editor(stdscr, height, width, editor_start_y, output_start_y)
     
+    # Adjust scroll position for initial cursor
+    adjust_scroll_position(cursor_y, editor_height)
+    
+    # Position cursor correctly
+    try:
+        stdscr.move(editor_start_y + cursor_y - scroll_offset_y, cursor_x)
+    except curses.error:
+        # Ignore cursor positioning errors
+        pass
+        
     try:
         while True:
             try:
@@ -170,12 +215,18 @@ async def update_screen(stdscr, websocket, cursor_pos=None):
                     error_message = data["message"]
                     output += f"\nERROR: {error_message}\n"
                 
+                # Recalculate editor height
+                editor_height = output_start_y - editor_start_y - 1
+                
+                # Adjust scroll position
+                adjust_scroll_position(cursor_y, editor_height)
+                
                 # Redraw entire screen
                 draw_editor(stdscr, height, width, editor_start_y, output_start_y)
                 
-                # Restore cursor position
+                # Restore cursor position with scroll offset
                 try:
-                    stdscr.move(editor_start_y + current_cursor_y, current_cursor_x)
+                    stdscr.move(editor_start_y + cursor_y - scroll_offset_y, cursor_x)
                 except curses.error:
                     # Ignore cursor positioning errors
                     pass
@@ -202,8 +253,10 @@ async def update_screen(stdscr, websocket, cursor_pos=None):
             # Refresh the screen - but not too frequently to avoid flicker
             # We'll only redraw every 200ms to reduce CPU usage and flickering
             draw_editor(stdscr, height, width, editor_start_y, output_start_y)
+            
+            # Update cursor position with scroll offset
             try:
-                stdscr.move(editor_start_y + current_cursor_y, current_cursor_x)
+                stdscr.move(editor_start_y + cursor_y - scroll_offset_y, cursor_x)
             except curses.error:
                 # Ignore curses errors when moving cursor
                 pass
@@ -218,14 +271,17 @@ async def update_screen(stdscr, websocket, cursor_pos=None):
         stdscr.getch()  # Wait for keypress before continuing
 
 def draw_editor(stdscr, height, width, editor_start_y, output_start_y):
-    global error_message
+    global error_message, cursor_x, cursor_y, scroll_offset_y, content
     
     # Clear screen
     stdscr.clear()
     
     # Draw header
-    header = f"Editing: {filename} (Press 'ESC' to exit, 'F5' or 'Ctrl+R' to run)"
+    header = f"Editing: {filename} (Press 'Ctrl+X' to exit, 'Ctrl+R' to run)"
     stdscr.addstr(0, 0, header[:width-1])
+    
+    # Calculate available editor space
+    editor_height = output_start_y - editor_start_y - 1
     
     # Draw separator
     separator = "-" * (width - 1)
@@ -233,17 +289,28 @@ def draw_editor(stdscr, height, width, editor_start_y, output_start_y):
     stdscr.addstr(output_start_y - 1, 0, separator)
     stdscr.addstr(output_start_y - 1, 0, " OUTPUT ")
     
-    # Draw content (code editor)
+    # Show scroll indicators if needed
     content_lines = content.split('\n')
-    for i, line in enumerate(content_lines):
-        if editor_start_y + i < output_start_y - 1:
+    if scroll_offset_y > 0:
+        stdscr.addstr(editor_start_y, width - 3, "↑")
+    if len(content_lines) > scroll_offset_y + editor_height:
+        stdscr.addstr(output_start_y - 2, width - 3, "↓")
+    
+    # Draw content (code editor) with scroll offset
+    for i in range(min(editor_height, len(content_lines) - scroll_offset_y)):
+        y_pos = editor_start_y + i
+        content_line_idx = scroll_offset_y + i
+        
+        if content_line_idx < len(content_lines):
+            line = content_lines[content_line_idx]
             try:
-                stdscr.addstr(editor_start_y + i, 0, line[:width-1])
+                # Display content at the original position, no offset for line numbers
+                stdscr.addstr(y_pos, 0, line[:width-1])
             except curses.error:
                 # Ignore curses errors when writing at the edge of the screen
                 pass
     
-    # FIX: Display any error message first in the output area
+    # Display any error message first in the output area
     if error_message:
         try:
             stdscr.attron(curses.A_BOLD)  # Make error messages bold
@@ -270,15 +337,22 @@ def draw_editor(stdscr, height, width, editor_start_y, output_start_y):
                 # Ignore curses errors when writing at the edge of the screen
                 pass
     
+    # Show cursor position at bottom of screen
+    pos_info = f"Line: {cursor_y+1}/{len(content_lines)}"
+    try:
+        stdscr.addstr(height-1, width - len(pos_info) - 1, pos_info)
+    except curses.error:
+        # Ignore positioning errors
+        pass
+    
     stdscr.refresh()
 
 async def send_edits(websocket, stdscr):
-    global content, output, error_message
+    global content, output, error_message, cursor_x, cursor_y, scroll_offset_y
     
     # Set up non-blocking input
     stdscr.nodelay(True)
     
-    cursor_x, cursor_y = 0, 0
     content_lines = content.split('\n')
     editor_start_y = 2
     
@@ -292,23 +366,47 @@ async def send_edits(websocket, stdscr):
                     await asyncio.sleep(0.01)
                     continue
                 
-                # ESC key to exit
-                if key == 27:
+                # Get current screen dimensions
+                height, width = stdscr.getmaxyx()
+                output_start_y = height // 2
+                editor_height = output_start_y - editor_start_y - 1
+                
+                # Get latest content lines
+                content_lines = content.split('\n')
+                
+                # Ctrl+X key to exit (ASCII value 24)
+                if key == 24:
+                    # Send CLOSE command to server
                     await websocket.send(json.dumps({"command": "CLOSE", "filename": filename}))
-                    break
+                    # Clear editor state
+                    content = ""
+                    output = ""
+                    error_message = ""
+                    scroll_offset_y = 0  # Reset scroll position
+                    # Cancel the tasks to exit edit mode
+                    edit_task.cancel()
+                    update_task.cancel()
+                    return
                     
-                # Run code with F5 key or Ctrl+R
-                elif key == curses.KEY_F5 or (key == ord('r') and stdscr.inch(0, 0) & curses.A_ALTCHARSET):
-                    await websocket.send(json.dumps({"command": "RUN", "filename": filename}))
-                # Run with Ctrl+R (many terminals send different codes for Ctrl combinations)
+                # Run code with Ctrl+R
                 elif key == 18:  # ASCII code for Ctrl+R
                     await websocket.send(json.dumps({"command": "RUN", "filename": filename}))
                     
+                # Page Up/Down for scrolling
+                elif key == curses.KEY_PPAGE:  # Page Up
+                    scroll_offset_y = max(0, scroll_offset_y - editor_height + 2)
+                    # Move cursor up if needed
+                    if cursor_y > scroll_offset_y + editor_height - 1:
+                        cursor_y = scroll_offset_y + editor_height - 1
+                elif key == curses.KEY_NPAGE:  # Page Down
+                    max_scroll = max(0, len(content_lines) - editor_height)
+                    scroll_offset_y = min(max_scroll, scroll_offset_y + editor_height - 2)
+                    # Move cursor down if needed
+                    if cursor_y < scroll_offset_y:
+                        cursor_y = scroll_offset_y
+                
                 # Backspace (different codes for different platforms)
                 elif key in [curses.KEY_BACKSPACE, 127, 8]:
-                    # FIX: Update content_lines before using it
-                    content_lines = content.split('\n')
-                    
                     # Make sure cursor is within valid range
                     if cursor_y >= len(content_lines):
                         cursor_y = len(content_lines) - 1
@@ -328,9 +426,6 @@ async def send_edits(websocket, stdscr):
                         
                 # Enter key
                 elif key in (curses.KEY_ENTER, 10, 13):
-                    # FIX: Update content_lines before using it
-                    content_lines = content.split('\n')
-                    
                     # Make sure cursor is within valid range
                     if cursor_y >= len(content_lines):
                         cursor_y = len(content_lines) - 1
@@ -345,27 +440,25 @@ async def send_edits(websocket, stdscr):
                 elif key == curses.KEY_LEFT and cursor_x > 0:
                     cursor_x -= 1
                 elif key == curses.KEY_RIGHT:
-                    # FIX: Update content_lines before using it
-                    content_lines = content.split('\n')
                     if cursor_y < len(content_lines) and cursor_x < len(content_lines[cursor_y]):
                         cursor_x += 1
                 elif key == curses.KEY_UP and cursor_y > 0:
                     cursor_y -= 1
-                    # FIX: Update content_lines before using it
-                    content_lines = content.split('\n')
                     cursor_x = min(cursor_x, len(content_lines[cursor_y]))
                 elif key == curses.KEY_DOWN:
-                    # FIX: Update content_lines before using it
-                    content_lines = content.split('\n')
                     if cursor_y < len(content_lines) - 1:
                         cursor_y += 1
                         cursor_x = min(cursor_x, len(content_lines[cursor_y]))
+                # Home key - move to start of line
+                elif key == curses.KEY_HOME:
+                    cursor_x = 0
+                # End key - move to end of line
+                elif key == curses.KEY_END:
+                    if cursor_y < len(content_lines):
+                        cursor_x = len(content_lines[cursor_y])
                     
                 # Regular character
                 elif key < 256:
-                    # FIX: Update content_lines before using it
-                    content_lines = content.split('\n')
-                    
                     # Make sure cursor is within valid range
                     if cursor_y >= len(content_lines):
                         cursor_y = len(content_lines) - 1
@@ -378,9 +471,12 @@ async def send_edits(websocket, stdscr):
                 content = '\n'.join(content_lines)
                 await websocket.send(json.dumps({"command": "EDIT", "filename": filename, "content": content}))
                 
-                # Place cursor at the right position
+                # Adjust scroll position to keep cursor visible
+                adjust_scroll_position(cursor_y, editor_height)
+                
+                # Place cursor at the right position with scroll offset - NO OFFSET NOW
                 try:
-                    stdscr.move(editor_start_y + cursor_y, cursor_x)
+                    stdscr.move(editor_start_y + cursor_y - scroll_offset_y, cursor_x)
                 except curses.error:
                     # Ignore curses errors when moving cursor
                     pass
@@ -389,13 +485,11 @@ async def send_edits(websocket, stdscr):
                 error_message = ""
                 
                 # Update screen with new cursor position
-                height, width = stdscr.getmaxyx()
-                output_start_y = height // 2
                 draw_editor(stdscr, height, width, editor_start_y, output_start_y)
                 
-                # Place cursor again after redraw
+                # Place cursor again after redraw - NO OFFSET NOW
                 try:
-                    stdscr.move(editor_start_y + cursor_y, cursor_x)
+                    stdscr.move(editor_start_y + cursor_y - scroll_offset_y, cursor_x)
                 except curses.error:
                     # Ignore curses errors when moving cursor
                     pass
@@ -424,7 +518,7 @@ async def send_edits(websocket, stdscr):
         stdscr.getch()
 
 async def main(stdscr):
-    global error_message
+    global error_message, filename, content, output, scroll_offset_y
     
     # Initialize screen
     curses.start_color()
@@ -439,39 +533,63 @@ async def main(stdscr):
             stdscr.addstr(0, 0, "Connected!")
             stdscr.refresh()
             
-            # First display file selection screen
-            file_selected = await file_selection_screen(stdscr, websocket)
-            if not file_selected:
-                return
-            
-            # Now open the selected file
-            await websocket.send(json.dumps({"command": "OPEN", "filename": filename}))
-            
-            # FIX: Wait for the server to respond with the file content
-            response = await websocket.recv()
-            try:
-                data = json.loads(response)
-                if data["command"] == "LOAD":
-                    global content
-                    content = data["content"]
-            except Exception as e:
-                error_message = f"Error loading file: {str(e)}"
-            
-            # Create separate tasks for screen updates and user input
-            # FIX: Don't use asyncio.wait as it can lead to race conditions
-            edit_task = asyncio.create_task(send_edits(websocket, stdscr))
-            update_task = asyncio.create_task(update_screen(stdscr, websocket))
-            
-            # Wait for both tasks
-            try:
-                # FIX: Task management to properly handle errors
-                await asyncio.gather(edit_task, update_task)
-            except asyncio.CancelledError:
-                pass
-            finally:
-                # Ensure tasks are properly cancelled
-                edit_task.cancel()
-                update_task.cancel()
+            while True:  # Add a loop to return to file selection after exiting edit mode
+                # Reset scroll position for new file
+                scroll_offset_y = 0
+                
+                # Display file selection screen
+                file_selected = await file_selection_screen(stdscr, websocket)
+                if not file_selected:
+                    return
+                
+                # Now open the selected file
+                await websocket.send(json.dumps({"command": "OPEN", "filename": filename}))
+                
+                # Wait for the server to respond with the file content
+                response = await websocket.recv()
+                try:
+                    data = json.loads(response)
+                    if data["command"] == "LOAD":
+                        content = data["content"]
+                except Exception as e:
+                    error_message = f"Error loading file: {str(e)}"
+                
+
+                # Create a variable to share between tasks
+                edit_done = False
+                
+                # Make tasks accessible in the key handler
+                global edit_task, update_task
+
+                # Create separate tasks for screen updates and user input
+                edit_task = asyncio.create_task(send_edits(websocket, stdscr))
+                update_task = asyncio.create_task(update_screen(stdscr, websocket))
+                
+                try:
+                    # Wait for both tasks
+                    await asyncio.gather(edit_task, update_task)
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    # Ensure tasks are properly cancelled
+                    if not edit_task.done():
+                        edit_task.cancel()
+                    if not update_task.done():
+                        update_task.cancel()
+                    
+                    # Try to await cancelled tasks to handle any exceptions
+                    try:
+                        await edit_task
+                    except asyncio.CancelledError:
+                        pass
+                    
+                    try:
+                        await update_task
+                    except asyncio.CancelledError:
+                        pass
+                
+                # If we reach here normally (not through return from file_selection_screen),
+                # we continue the loop to return to file selection
                 
     except websockets.exceptions.ConnectionError:
         stdscr.clear()
