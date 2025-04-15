@@ -518,7 +518,7 @@ class CodeClient:
         print(f"=== Running {filename} ===\n")
         
         # Ask for input if needed
-        print("Enter input for the program line by line (end with'EOF'):")
+        print("Enter input for the program line by line (end with 'EOF'):")
         input_data = ""
         lines = []
         while True:
